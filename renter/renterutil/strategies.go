@@ -2,6 +2,7 @@ package renterutil
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -327,7 +328,7 @@ func (mcu MinimumChunkUploader) UploadChunk(db MetaDB, c DBChunk, key renter.Key
 
 // A ChunkDownloader downloads the shards of a chunk.
 type ChunkDownloader interface {
-	DownloadChunk(db MetaDB, c DBChunk, key renter.KeySeed, off, n int64) ([][]byte, error)
+	DownloadChunk(ctx context.Context, db MetaDB, c DBChunk, key renter.KeySeed, off, n int64) ([][]byte, error)
 }
 
 // SerialChunkDownloader downloads the shards of a chunk one at a time.
@@ -336,7 +337,7 @@ type SerialChunkDownloader struct {
 }
 
 // DownloadChunk implements ChunkDownloader.
-func (scd SerialChunkDownloader) DownloadChunk(db MetaDB, c DBChunk, key renter.KeySeed, off, n int64) ([][]byte, error) {
+func (scd SerialChunkDownloader) DownloadChunk(ctx context.Context, db MetaDB, c DBChunk, key renter.KeySeed, off, n int64) ([][]byte, error) {
 	minChunkSize := merkle.SegmentSize * int64(c.MinShards)
 	shards := make([][]byte, len(c.Shards))
 	for i := range shards {
@@ -345,6 +346,10 @@ func (scd SerialChunkDownloader) DownloadChunk(db MetaDB, c DBChunk, key renter.
 	var errs HostErrorSet
 	need := c.MinShards
 	for i, ssid := range c.Shards {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		shard, err := db.Shard(ssid)
 		if err != nil {
 			return nil, err
@@ -396,7 +401,7 @@ type ParallelChunkDownloader struct {
 }
 
 // DownloadChunk implements ChunkDownloader.
-func (pcd ParallelChunkDownloader) DownloadChunk(db MetaDB, c DBChunk, key renter.KeySeed, off, n int64) ([][]byte, error) {
+func (pcd ParallelChunkDownloader) DownloadChunk(ctx context.Context, db MetaDB, c DBChunk, key renter.KeySeed, off, n int64) ([][]byte, error) {
 	minChunkSize := merkle.SegmentSize * int64(c.MinShards)
 	start := (off / minChunkSize) * merkle.SegmentSize
 	end := ((off + n) / minChunkSize) * merkle.SegmentSize
@@ -473,7 +478,12 @@ func (pcd ParallelChunkDownloader) DownloadChunk(db MetaDB, c DBChunk, key rente
 
 	var goodShards int
 	var errs HostErrorSet
+	defer close(reqChan)
 	for goodShards < int(c.MinShards) && goodShards+len(errs) < len(c.Shards) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		resp := <-respChan
 		if resp.err == nil {
 			goodShards++
@@ -496,7 +506,6 @@ func (pcd ParallelChunkDownloader) DownloadChunk(db MetaDB, c DBChunk, key rente
 			}
 		}
 	}
-	close(reqChan)
 	if goodShards < int(c.MinShards) {
 		return nil, fmt.Errorf("too many hosts did not supply their shard (needed %v, got %v): %w", c.MinShards, goodShards, errs)
 	}
@@ -536,7 +545,7 @@ func (gcu GenericChunkUpdater) UpdateChunk(db MetaDB, b DBBlob, c DBChunk) (uint
 	}
 
 	// download
-	shards, err := gcu.D.DownloadChunk(db, c, b.DeriveKey(c.ID), 0, int64(c.Len))
+	shards, err := gcu.D.DownloadChunk(context.TODO(), db, c, b.DeriveKey(c.ID), 0, int64(c.Len))
 	if err != nil {
 		return 0, err
 	}
@@ -741,7 +750,7 @@ func (pbu ParallelBlobUploader) UploadBlob(db MetaDB, b DBBlob, r io.Reader) err
 
 // A BlobDownloader downloads blob data, writing it to w.
 type BlobDownloader interface {
-	DownloadBlob(db MetaDB, b DBBlob, w io.Writer, off, n int64) error
+	DownloadBlob(ctx context.Context, db MetaDB, b DBBlob, w io.Writer, off, n int64) error
 }
 
 // SerialBlobDownloader downloads the chunks of a blob one at a time.
@@ -750,8 +759,12 @@ type SerialBlobDownloader struct {
 }
 
 // DownloadBlob implements BlobDownloader.
-func (sbd SerialBlobDownloader) DownloadBlob(db MetaDB, b DBBlob, w io.Writer, off, n int64) error {
+func (sbd SerialBlobDownloader) DownloadBlob(ctx context.Context, db MetaDB, b DBBlob, w io.Writer, off, n int64) error {
 	for _, cid := range b.Chunks {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		c, err := db.Chunk(cid)
 		if err != nil {
 			return err
@@ -765,7 +778,7 @@ func (sbd SerialBlobDownloader) DownloadBlob(db MetaDB, b DBBlob, w io.Writer, o
 		if reqLen < 0 || reqLen > int64(c.Len) {
 			reqLen = int64(c.Len)
 		}
-		shards, err := sbd.D.DownloadChunk(db, c, b.DeriveKey(c.ID), off, reqLen)
+		shards, err := sbd.D.DownloadChunk(ctx, db, c, b.DeriveKey(c.ID), off, reqLen)
 		if err != nil {
 			return err
 		}
@@ -791,7 +804,7 @@ type ParallelBlobDownloader struct {
 }
 
 // DownloadBlob implements BlobDownloader.
-func (pbd ParallelBlobDownloader) DownloadBlob(db MetaDB, b DBBlob, w io.Writer, off, n int64) error {
+func (pbd ParallelBlobDownloader) DownloadBlob(ctx context.Context, db MetaDB, b DBBlob, w io.Writer, off, n int64) error {
 	// spawn workers
 	type req struct {
 		c      DBChunk
@@ -807,12 +820,15 @@ func (pbd ParallelBlobDownloader) DownloadBlob(db MetaDB, b DBBlob, w io.Writer,
 	respChan := make(chan resp)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	for i := 0; i < pbd.P; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for req := range reqChan {
-				shards, err := pbd.D.DownloadChunk(db, req.c, b.DeriveKey(req.c.ID), req.off, req.n)
+				shards, err := pbd.D.DownloadChunk(ctx, db, req.c, b.DeriveKey(req.c.ID), req.off, req.n)
 				if err != nil {
 					respChan <- resp{req.index, nil, err}
 					continue
@@ -828,6 +844,14 @@ func (pbd ParallelBlobDownloader) DownloadBlob(db MetaDB, b DBBlob, w io.Writer,
 			}
 		}()
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+		for req := range reqChan {
+			respChan <- resp{index: req.index, chunk: nil, err: ctx.Err()}
+		}
+	}()
 
 	// when a response arrives, write the chunk into a circular buffer, then
 	// flush as many chunks as possible
@@ -858,14 +882,18 @@ func (pbd ParallelBlobDownloader) DownloadBlob(db MetaDB, b DBBlob, w io.Writer,
 	// if we return early (due to an error), ensure that we consume all
 	// outstanding requests
 	defer func() {
-		close(reqChan)
 		for inflight > 0 {
 			_ = consumeResp()
 		}
+		close(reqChan)
 	}()
 
 	// request each chunk
 	for chunkIndex, cid := range b.Chunks {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		c, err := db.Chunk(cid)
 		if err != nil {
 			return err

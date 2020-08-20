@@ -2,6 +2,7 @@ package renterutil
 
 import (
 	"bytes"
+	"context"
 	"io"
 
 	"lukechampine.com/frand"
@@ -82,7 +83,7 @@ func (kv PseudoKV) Resume(key []byte, rs io.ReadSeeker) error {
 
 // GetRange downloads a range of bytes within the value associated with key and
 // writes it to w.
-func (kv PseudoKV) GetRange(key []byte, w io.Writer, off, n int64) error {
+func (kv PseudoKV) GetRange(ctx context.Context, key []byte, w io.Writer, off, n int64) error {
 	b, err := kv.DB.Blob(key)
 	if err != nil {
 		return err
@@ -91,18 +92,18 @@ func (kv PseudoKV) GetRange(key []byte, w io.Writer, off, n int64) error {
 		D: kv.Downloader,
 		P: kv.P,
 	}
-	return bd.DownloadBlob(kv.DB, b, w, off, n)
+	return bd.DownloadBlob(ctx, kv.DB, b, w, off, n)
 }
 
 // Get downloads the value associated with key and writes it to w.
-func (kv PseudoKV) Get(key []byte, w io.Writer) error {
-	return kv.GetRange(key, w, 0, -1)
+func (kv PseudoKV) Get(ctx context.Context, key []byte, w io.Writer) error {
+	return kv.GetRange(ctx, key, w, 0, -1)
 }
 
 // GetBytes downloads the value associated with key and returns it as a []byte.
-func (kv PseudoKV) GetBytes(key []byte) ([]byte, error) {
+func (kv PseudoKV) GetBytes(ctx context.Context, key []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	err := kv.Get(key, &buf)
+	err := kv.Get(ctx, key, &buf)
 	return buf.Bytes(), err
 }
 
